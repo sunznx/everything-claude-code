@@ -248,7 +248,7 @@ function detectFailureCode(text) {
   return null;
 }
 
-function requestHttp(urlString, headers, timeoutMs) {
+function requestHttpProbe(urlString, headers, timeoutMs) {
   return new Promise(resolve => {
     let settled = false;
     let timedOut = false;
@@ -286,6 +286,70 @@ function requestHttp(urlString, headers, timeoutMs) {
         ok: false,
         statusCode: null,
         reason: timedOut ? 'request timed out' : error.message
+      });
+    });
+
+    req.end();
+  });
+}
+
+// Try SSE connection for MCP servers that might not respond to simple GET
+function requestSseProbe(urlString, headers, timeoutMs) {
+  return new Promise(resolve => {
+    let settled = false;
+    let timedOut = false;
+
+    const url = new URL(urlString);
+    const client = url.protocol === 'https:' ? https : http;
+
+    // Set headers for SSE connection
+    const sseHeaders = {
+      ...headers,
+      'Accept': 'text/event-stream',
+      'Cache-Control': 'no-cache'
+    };
+
+    const req = client.request(
+      url,
+      {
+        method: 'GET',
+        headers: sseHeaders,
+      },
+      res => {
+        if (settled) return;
+
+        // For SSE, we consider connection successful if we get:
+        // - 200 OK with content-type text/event-stream
+        // - Or we can at least establish the connection
+        const isSse = res.headers['content-type']?.includes('text/event-stream');
+        const connectionOk = res.statusCode === 200 && (isSse || res.headers['content-type']?.includes('json'));
+
+        if (settled) return;
+        settled = true;
+        res.resume();
+
+        resolve({
+          ok: connectionOk,
+          statusCode: res.statusCode,
+          reason: connectionOk
+            ? 'SSE connection established'
+            : `SSE connection failed: HTTP ${res.statusCode} (${res.headers['content-type'] || 'no content-type'})`
+        });
+      }
+    );
+
+    req.setTimeout(timeoutMs, () => {
+      timedOut = true;
+      req.destroy(new Error('timeout'));
+    });
+
+    req.on('error', error => {
+      if (settled) return;
+      settled = true;
+      resolve({
+        ok: false,
+        statusCode: null,
+        reason: timedOut ? 'SSE connection timed out' : error.message
       });
     });
 
@@ -379,16 +443,75 @@ function probeCommandServer(serverName, config) {
   });
 }
 
-async function probeServer(serverName, resolvedConfig) {
+async function probeServer(serverName, resolvedConfig, knownProbeMethod = null) {
   const config = resolvedConfig.config;
 
   if (config.type === 'http' || config.url) {
-    const result = await requestHttp(config.url, config.headers || {}, envNumber('ECC_MCP_HEALTH_TIMEOUT_MS', DEFAULT_TIMEOUT_MS));
+    const timeoutMs = envNumber('ECC_MCP_HEALTH_TIMEOUT_MS', DEFAULT_TIMEOUT_MS);
+    const headers = config.headers || {};
 
+    // If we know which probe method works from previous check, use it directly
+    if (knownProbeMethod === 'http') {
+      const result = await requestHttpProbe(config.url, headers, timeoutMs);
+      return {
+        ok: result.ok,
+        failureCode: RECONNECT_STATUS_CODES.has(result.statusCode) ? result.statusCode : null,
+        reason: result.reason,
+        source: resolvedConfig.source
+      };
+    }
+
+    if (knownProbeMethod === 'sse') {
+      const result = await requestSseProbe(config.url, headers, timeoutMs);
+      return {
+        ok: result.ok,
+        failureCode: RECONNECT_STATUS_CODES.has(result.statusCode) ? result.statusCode : null,
+        reason: result.reason,
+        source: resolvedConfig.source
+      };
+    }
+
+    // First time probing: try GET first, then SSE on 4xx
+    const simpleProbe = await requestHttpProbe(config.url, headers, timeoutMs);
+
+    if (simpleProbe.ok) {
+      return {
+        ok: true,
+        failureCode: null,
+        reason: simpleProbe.reason,
+        source: resolvedConfig.source,
+        probeMethod: 'http'  // Remember GET worked
+      };
+    }
+
+    // If simple probe fails with 4xx, try SSE connection
+    if (simpleProbe.statusCode >= 400 && simpleProbe.statusCode < 500) {
+      const sseProbe = await requestSseProbe(config.url, headers, timeoutMs);
+
+      if (sseProbe.ok) {
+        return {
+          ok: true,
+          failureCode: null,
+          reason: `GET->SSE: ${sseProbe.reason}`,
+          source: resolvedConfig.source,
+          probeMethod: 'sse'  // Remember SSE worked
+        };
+      }
+
+      // SSE also failed, return the original error
+      return {
+        ok: false,
+        failureCode: RECONNECT_STATUS_CODES.has(simpleProbe.statusCode) ? simpleProbe.statusCode : null,
+        reason: `${simpleProbe.reason}; SSE: ${sseProbe.reason}`,
+        source: resolvedConfig.source
+      };
+    }
+
+    // For 5xx or connection errors, return the simple probe result
     return {
-      ok: result.ok,
-      failureCode: RECONNECT_STATUS_CODES.has(result.statusCode) ? result.statusCode : null,
-      reason: result.reason,
+      ok: simpleProbe.ok,
+      failureCode: RECONNECT_STATUS_CODES.has(simpleProbe.statusCode) ? simpleProbe.statusCode : null,
+      reason: simpleProbe.reason,
       source: resolvedConfig.source
     };
   }
@@ -485,9 +608,20 @@ async function handlePreToolUse(rawInput, input, target, statePathValue, now) {
     return { rawInput, exitCode: 0, logs };
   }
 
-  const probe = await probeServer(target.server, resolvedConfig);
+  // Skip health check if server has skipHealthCheck: true in config
+  if (resolvedConfig.config.skipHealthCheck === true) {
+    return { rawInput, exitCode: 0, logs };
+  }
+
+  // Use known probe method from previous successful check, or discover new one
+  const knownProbeMethod = previous.probeMethod || null;
+  const probe = await probeServer(target.server, resolvedConfig, knownProbeMethod);
+
   if (probe.ok) {
-    markHealthy(state, target.server, now, { source: resolvedConfig.source });
+    markHealthy(state, target.server, now, {
+      source: resolvedConfig.source,
+      probeMethod: probe.probeMethod || knownProbeMethod  // Remember which method worked
+    });
     saveState(statePathValue, state);
 
     if (previous.status === 'unhealthy') {
